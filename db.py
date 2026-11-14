@@ -52,8 +52,12 @@ CREATE TABLE IF NOT EXISTS bookings (
     date_id TEXT NOT NULL,
     num_participants INTEGER NOT NULL,
     total_amount INTEGER NOT NULL,
-    payment_status TEXT NOT NULL,
-    booking_status TEXT NOT NULL,
+    payment_status TEXT NOT NULL,          -- Pending / Paid / Failed
+    booking_status TEXT NOT NULL,          -- Pending / Confirmed / Cancelled
+    transaction_id TEXT,                   -- UTR / Transaction ID
+    payment_screenshot TEXT,               -- path of uploaded screenshot
+    payment_method TEXT DEFAULT 'UPI',
+    verified_at TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -281,7 +285,9 @@ def get_participants(booking_id=None):
 
 
 def create_booking(user_id, trek_id, date_id, participants, total_amount):
-    """Atomic: re-checks seats inside a write transaction (prevents overbooking)."""
+    """Atomic: re-checks seats inside a write transaction (prevents overbooking).
+       Creates booking as Pending and holds seats temporarily.
+    """
     db = get_db()
     qty = len(participants)
     db.execute("BEGIN IMMEDIATE")
@@ -295,6 +301,8 @@ def create_booking(user_id, trek_id, date_id, participants, total_amount):
             return {"success": False,
                     "message": f"Overbooking prevented! Only {row['available_seats']} seats are "
                                f"available for this date, but you requested {qty}."}
+        
+        # Hold seats temporarily
         db.execute("UPDATE trek_dates SET available_seats = available_seats - ? WHERE id=?", (qty, date_id))
 
         booking_id = None
@@ -307,10 +315,18 @@ def create_booking(user_id, trek_id, date_id, participants, total_amount):
             db.execute("ROLLBACK")
             return {"success": False, "message": "Could not allocate a booking ID. Please retry."}
 
+        # Create as Pending (not Paid/Confirmed)
         db.execute(
-            "INSERT INTO bookings VALUES (?,?,?,?,?,?,?,?,?)",
-            (booking_id, user_id, trek_id, date_id, qty, total_amount, "Paid", "Confirmed",
-             datetime.now().isoformat(timespec="seconds")))
+            """INSERT INTO bookings 
+               (id, user_id, trek_id, date_id, num_participants, total_amount, 
+                payment_status, booking_status, transaction_id, payment_screenshot, 
+                payment_method, verified_at, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (booking_id, user_id, trek_id, date_id, qty, total_amount,
+             "Pending", "Pending", None, None, "UPI", None,
+             datetime.now().isoformat(timespec="seconds"))
+        )
+
         cols = ["name", "gender", "contact", "whatsapp", "email", "dob", "age", "blood_group",
                 "food_pref", "tshirt_size", "id_type", "id_number", "emergency_name",
                 "emergency_rel", "emergency_num", "experience", "fitness", "limitations",
@@ -319,8 +335,89 @@ def create_booking(user_id, trek_id, date_id, participants, total_amount):
                f"VALUES ({', '.join('?' * (len(cols) + 2))})")
         for i, p in enumerate(participants):
             db.execute(sql, (f"part-{booking_id}-{i}", booking_id, *[p[c] for c in cols]))
+        
         db.execute("COMMIT")
         return {"success": True, "booking_id": booking_id}
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+def submit_payment_proof(booking_id, transaction_id=None, screenshot_path=None):
+    """User submits UTR or screenshot (at least one is mandatory)."""
+    db = get_db()
+    
+    if not transaction_id and not screenshot_path:
+        return {"success": False, "message": "Please provide either Transaction ID (UTR) or Screenshot."}
+    
+    b = get_booking(booking_id)
+    if not b:
+        return {"success": False, "message": "Booking not found."}
+    
+    if b["booking_status"] != "Pending":
+        return {"success": False, "message": "This booking is already processed."}
+
+    db.execute(
+        """UPDATE bookings 
+           SET transaction_id = ?, payment_screenshot = ?
+           WHERE id = ?""",
+        (transaction_id or None, screenshot_path or None, booking_id)
+    )
+    return {"success": True, "message": "Payment proof submitted successfully. Waiting for admin verification."}
+
+
+def admin_verify_booking(booking_id, action):
+    """
+    Admin approves or rejects a pending booking.
+    action = 'approve' or 'reject'
+    """
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        b = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+        if not b:
+            db.execute("ROLLBACK")
+            return {"success": False, "message": "Booking not found."}
+        
+        if b["booking_status"] != "Pending":
+            db.execute("ROLLBACK")
+            return {"success": False, "message": "This booking is already processed."}
+
+        if action == "approve":
+            db.execute(
+                """UPDATE bookings 
+                   SET payment_status='Paid', 
+                       booking_status='Confirmed',
+                       verified_at=? 
+                   WHERE id=?""",
+                (datetime.now().isoformat(timespec="seconds"), booking_id)
+            )
+            db.execute("COMMIT")
+            return {"success": True, "message": "Booking Approved Successfully."}
+
+        elif action == "reject":
+            # Release the temporarily held seats
+            db.execute(
+                """UPDATE trek_dates 
+                   SET available_seats = available_seats + ? 
+                   WHERE id=?""",
+                (b["num_participants"], b["date_id"])
+            )
+            db.execute(
+                """UPDATE bookings 
+                   SET payment_status='Failed', 
+                       booking_status='Cancelled',
+                       verified_at=? 
+                   WHERE id=?""",
+                (datetime.now().isoformat(timespec="seconds"), booking_id)
+            )
+            db.execute("COMMIT")
+            return {"success": True, "message": "Booking Rejected. Seats have been released."}
+        
+        else:
+            db.execute("ROLLBACK")
+            return {"success": False, "message": "Invalid action."}
+
     except Exception:
         db.execute("ROLLBACK")
         raise
@@ -337,6 +434,7 @@ def cancel_booking(booking_id):
         if b["booking_status"] == "Cancelled":
             db.execute("ROLLBACK")
             return {"success": False, "message": "Booking is already cancelled."}
+        
         db.execute("UPDATE bookings SET booking_status='Cancelled', payment_status='Refunded' WHERE id=?",
                    (booking_id,))
         db.execute(
@@ -349,10 +447,18 @@ def cancel_booking(booking_id):
         raise
 
 
+def get_pending_bookings():
+    """Return all bookings that are waiting for admin verification."""
+    return [_booking(r) for r in get_db().execute(
+        "SELECT * FROM bookings WHERE booking_status='Pending' ORDER BY created_at DESC"
+    )]
+
+
 # --------------------------------------------------------------------- admin
 def admin_stats():
     db = get_db()
     confirmed = [dict(r) for r in db.execute("SELECT * FROM bookings WHERE booking_status='Confirmed'")]
+    pending = [dict(r) for r in db.execute("SELECT * FROM bookings WHERE booking_status='Pending'")]
     per_trek = {}
     for b in confirmed:
         per_trek[b["trek_id"]] = per_trek.get(b["trek_id"], 0) + b["num_participants"]
@@ -365,6 +471,7 @@ def admin_stats():
     upcoming = get_dates(upcoming_only=True)
     return {
         "total_bookings": len(confirmed),
+        "total_pending": len(pending),
         "total_revenue": sum(b["total_amount"] for b in confirmed),
         "total_participants": sum(b["num_participants"] for b in confirmed),
         "popular_trek": popular,
@@ -403,7 +510,7 @@ def export_bookings_csv():
     w.writerow(["Booking ID", "Trek", "Date", "Price", "Participant Name", "Gender", "Age",
                 "Contact", "Whatsapp", "Email", "Emergency Contact", "Emergency Number",
                 "Food Preference", "T-Shirt Size", "Blood Group", "ID Type", "ID Number",
-                "Payment Status", "Booking Status"])
+                "Payment Status", "Booking Status", "Transaction ID"])
     for p in get_participants():
         b = bookings.get(p["booking_id"], {})
         t = treks.get(b.get("trek_id"), {})
@@ -414,6 +521,7 @@ def export_bookings_csv():
             t.get("price", 0), p["name"], p["gender"], p["age"], p["contact"], p["whatsapp"],
             p["email"], f"{p['emergency_name']} ({p['emergency_rel']})", p["emergency_num"],
             p["food_pref"], p["tshirt_size"], p["blood_group"] or "N/A", p["id_type"],
-            p["id_number"], b.get("payment_status", "N/A"), b.get("booking_status", "N/A")]
+            p["id_number"], b.get("payment_status", "N/A"), b.get("booking_status", "N/A"),
+            b.get("transaction_id") or ""]
         w.writerow([_safe(c) for c in row])
     return buf.getvalue()
