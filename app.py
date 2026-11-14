@@ -9,6 +9,7 @@ from pathlib import Path
 
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template,
                    request, session, url_for)
+from werkzeug.utils import secure_filename
 
 import db
 
@@ -22,7 +23,10 @@ app.config.update(
     ADMIN_PASSWORD=os.environ.get("TAF_ADMIN_PASSWORD", "trekadmin2026"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    UPLOAD_FOLDER=str(BASE_DIR / "uploads"),
+    MAX_CONTENT_LENGTH=5 * 1024 * 1024,  # 5 MB max for screenshots
 )
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 db.init_db(app)
 
 COUPONS = {"TAF10": 0.10}
@@ -293,8 +297,9 @@ def booking(trek_id):
 
     if not current_user():
         session["user"] = primary_email
-    flash("Booking Successful! Payment Processed.")
-    return redirect(url_for("confirmation", booking_id=res["booking_id"]))
+
+    # Redirect to Payment Page instead of Confirmation
+    return redirect(url_for("payment_page", booking_id=res["booking_id"]))
 
 
 @app.post("/api/coupon")
@@ -343,6 +348,61 @@ def download_ticket(booking_id):
     lines += ["", "Support: +91 8104799308", "Emergency: +91 7083019308"]
     return Response("\n".join(lines), mimetype="text/plain; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename=TAF-Ticket-{b['id']}.txt"})
+
+
+# --------------------------------------------------------------- Payment
+@app.route("/payment/<booking_id>", methods=["GET", "POST"])
+def payment_page(booking_id):
+    booking = db.get_booking(booking_id)
+    if not booking:
+        flash("Booking not found.", "error")
+        return redirect(url_for("home"))
+
+    if booking["booking_status"] != "Pending":
+        flash("This booking is already processed.", "info")
+        return redirect(url_for("confirmation", booking_id=booking_id))
+
+    trek = db.get_trek(booking["trek_id"])
+    date_info = db.get_date(booking["date_id"])
+
+    if request.method == "POST":
+        transaction_id = request.form.get("transaction_id", "").strip()
+        screenshot = request.files.get("payment_screenshot")
+
+        screenshot_path = None
+        if screenshot and screenshot.filename:
+            filename = f"{booking_id}_{secure_filename(screenshot.filename)}"
+            path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            screenshot.save(path)
+            screenshot_path = filename
+
+        result = db.submit_payment_proof(
+            booking_id,
+            transaction_id=transaction_id if transaction_id else None,
+            screenshot_path=screenshot_path
+        )
+
+        if result["success"]:
+            flash(result["message"], "success")
+            return redirect(url_for("payment_submitted", booking_id=booking_id))
+        else:
+            flash(result["message"], "error")
+
+    return render_template(
+        "payment.html",
+        booking=booking,
+        trek=trek,
+        date=date_info
+    )
+
+
+@app.route("/payment-submitted/<booking_id>")
+def payment_submitted(booking_id):
+    booking = db.get_booking(booking_id)
+    if not booking:
+        flash("Booking not found.", "error")
+        return redirect(url_for("home"))
+    return render_template("payment_submitted.html", booking=booking)
 
 
 # --------------------------------------------------------------- user area
@@ -425,6 +485,20 @@ def admin_login():
     return redirect(url_for("admin"))
 
 
+@app.post("/admin/verify/<booking_id>/<action>")
+@admin_required
+def admin_verify(booking_id, action):
+    if action not in ("approve", "reject"):
+        flash("Invalid action.", "error")
+        return redirect(url_for("admin", tab="bookings"))
+
+    result = db.admin_verify_booking(booking_id, action)
+    flash(result["message"], "success" if result["success"] else "error")
+
+    # Later we will trigger Email + SMS here when action == "approve"
+    return redirect(url_for("admin", tab="bookings"))
+
+
 def _lines(text):
     return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
 
@@ -449,7 +523,6 @@ def admin_trek_save():
         flash("Please fill in all trek fields with valid values.", "error")
         return redirect(url_for("admin", tab="treks"))
 
-    # Allow both full URLs and local paths under /static/
     img = data["image"]
     if not (img.lower().startswith(("http://", "https://")) or img.startswith("/static/")):
         flash("Image must be a full URL (https://...) or a local path starting with /static/", "error")
